@@ -50,8 +50,13 @@ async def ws_timesync(ctx):
     c = await ctx.new_client(0)
     try:
         offset, rtt, d = await c.timesync_ws()
+    except ConnectionError as e:
+        ctx.check("WebSocket TimeSync", False,
+                  f"server closed the socket on the TimeSync probe ({e}) - it rejects unknown "
+                  "WS message types (stock Jellyfin <=10.11); no protocol v2 time sync")
+        return
     except TimeoutError:
-        ctx.check("WebSocket TimeSync", False, "no TimeSync response within 5s")
+        ctx.check("WebSocket TimeSync", False, "no TimeSync response within 5s (socket stayed open)")
         return
     ctx.check(
         "WebSocket TimeSync",

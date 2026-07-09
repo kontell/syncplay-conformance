@@ -108,50 +108,78 @@ async def main():
                 return m
         return None
 
-    # 6. Keep-alive round trip.
-    t0 = time.time()
-    await ws.send(json.dumps({"MessageType": "KeepAlive"}))
-    m = await recv_until(lambda m: m.get("MessageType") == "KeepAlive", 10)
-    if m:
-        report("PASS", "keep-alive round trip", f"{(time.time()-t0)*1000:.0f}ms")
-    else:
-        report("FAIL", "keep-alive round trip", "no KeepAlive response in 10s - messages are not flowing")
+    def closed_report(e):
+        """Classify a close during a check that should NOT close the socket
+        (keep-alive, idle survival). An abnormal 1006 (no close frame) is the
+        transport/proxy severing the connection - the doctor's core concern, so
+        a FAIL. A clean app-level close (1000 + reason) here means the server
+        dropped a healthy idle socket: still not the proxy, but worth flagging."""
+        code, reason = getattr(e, "code", None), (getattr(e, "reason", "") or "")
+        if code == 1006:
+            report("FAIL", "connection stability",
+                   f"socket dropped abnormally ({code}) with no close frame - typically a "
+                   "proxy/tunnel severing the connection; raise read/idle timeouts (docs/operators.md)")
+        else:
+            report("WARN", "connection stability",
+                   f"server closed a healthy socket ({code} {reason or 'no reason'}) - not a proxy "
+                   "fault; check the Jellyfin service for restarts.")
 
-    # 7. TimeSync (protocol v2 servers).
-    t0_ms = int(time.time() * 1000)
-    await ws.send(json.dumps({"MessageType": "TimeSync", "Data": t0_ms}))
-    m = await recv_until(lambda m: m.get("MessageType") == "TimeSync"
-                         and isinstance(m.get("Data"), dict) and m["Data"].get("T0") == t0_ms, 5)
-    if m:
-        t3 = time.time() * 1000
-        d = m["Data"]
-        rtt = (t3 - d["T0"]) - (d["T2"] - d["T1"])
-        offset = ((d["T1"] - d["T0"]) + (d["T2"] - t3)) / 2
-        report("PASS", "WebSocket TimeSync (v2)", f"rtt={rtt:.0f}ms offset={offset:+.0f}ms")
-        if abs(offset - http_offset) > 250:
-            report("WARN", "offset asymmetry",
-                   f"HTTP vs WS offset differ by {abs(offset-http_offset):.0f}ms - HTTP path is likely "
-                   "queueing (H2 multiplexing/bufferbloat); v2 clients will be fine, v1 clients may drift")
-    else:
-        report("WARN", "WebSocket TimeSync (v2)",
-               "no response - server predates protocol v2; clients fall back to HTTP time sync")
+    try:
+        # 6. Keep-alive round trip.
+        t0 = time.time()
+        await ws.send(json.dumps({"MessageType": "KeepAlive"}))
+        m = await recv_until(lambda m: m.get("MessageType") == "KeepAlive", 10)
+        if m:
+            report("PASS", "keep-alive round trip", f"{(time.time()-t0)*1000:.0f}ms")
+        else:
+            report("FAIL", "keep-alive round trip", "no KeepAlive response in 10s - messages are not flowing")
 
-    # 8. Idle survival (optional).
-    if args.long:
-        print("      holding the socket idle for 100s (proxy idle-timeout test)...")
-        m = await recv_until(lambda m: False, 100)  # consume anything, expect server keepalives
-        try:
+        # 7. Idle survival (optional). Runs BEFORE the TimeSync probe because
+        # that probe can itself close the socket (see step 8), which would
+        # otherwise sabotage this check on a stock server.
+        if args.long:
+            print("      holding the socket idle for 100s (proxy idle-timeout test)...")
+            await recv_until(lambda m: False, 100)  # consume anything, expect server keepalives
             await ws.send(json.dumps({"MessageType": "KeepAlive"}))
             m = await recv_until(lambda m: m.get("MessageType") == "KeepAlive", 10)
             if m:
                 report("PASS", "idle survival (100s)", "socket alive after 100s idle")
             else:
                 report("FAIL", "idle survival (100s)", "socket dead after idle - raise proxy read/idle timeouts")
-        except Exception as e:
-            report("FAIL", "idle survival (100s)",
-                   f"socket closed during idle ({type(e).__name__}) - raise proxy read/idle timeouts to >=90s")
 
-    await ws.close()
+        # 8. TimeSync (protocol v2 servers). LAST, because it is destructive on
+        # servers that reject unknown WS message types: stock Jellyfin (<=10.11)
+        # throws deserializing an unrecognised MessageType and tears the socket
+        # down (close 1000 "System Shutdown", though the server stays up), so
+        # this probe must not precede any other check.
+        t0_ms = int(time.time() * 1000)
+        try:
+            await ws.send(json.dumps({"MessageType": "TimeSync", "Data": t0_ms}))
+            m = await recv_until(lambda m: m.get("MessageType") == "TimeSync"
+                                 and isinstance(m.get("Data"), dict) and m["Data"].get("T0") == t0_ms, 5)
+            if m:
+                t3 = time.time() * 1000
+                d = m["Data"]
+                rtt = (t3 - d["T0"]) - (d["T2"] - d["T1"])
+                offset = ((d["T1"] - d["T0"]) + (d["T2"] - t3)) / 2
+                report("PASS", "WebSocket TimeSync (v2)", f"rtt={rtt:.0f}ms offset={offset:+.0f}ms")
+                if abs(offset - http_offset) > 250:
+                    report("WARN", "offset asymmetry",
+                           f"HTTP vs WS offset differ by {abs(offset-http_offset):.0f}ms - HTTP path is likely "
+                           "queueing (H2 multiplexing/bufferbloat); v2 clients will be fine, v1 clients may drift")
+            else:
+                report("WARN", "WebSocket TimeSync (v2)",
+                       "no response - server predates protocol v2; clients fall back to HTTP time sync")
+        except websockets.ConnectionClosed as e:
+            report("WARN", "WebSocket TimeSync (v2)",
+                   f"server closed the socket on the probe ({e.code} {e.reason or 'no reason'}) - it "
+                   "rejects unrecognised WS message types (stock Jellyfin <=10.11 does this); no "
+                   "protocol v2. v1 clients that never send TimeSync are unaffected.")
+
+        await ws.close()
+    except websockets.ConnectionClosed as e:
+        closed_report(e)
+
     return summary()
 
 
