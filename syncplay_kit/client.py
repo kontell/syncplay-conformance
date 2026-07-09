@@ -61,6 +61,7 @@ class SyncPlayClient:
         self.ws2 = None
         self.ws2_msgs = []
         self.closed_at = None
+        self.close_info = None  # (code, reason) of the ws1 close, if any
         self.playlist_item_id = None
         self._log = log or (lambda *a, **k: None)
 
@@ -147,8 +148,18 @@ class SyncPlayClient:
                         ({"Command": d.get("Command"), "V": d.get("StateVersion")} if isinstance(d, dict) else d)
                     self._log(self.name, f"recv[{tag}]", type=mt, data=brief)
         except Exception as e:
-            self.closed_at = time.time()
-            self._log(self.name, f"ws_closed[{tag}]", err=str(e)[:90])
+            self._log(self.name, f"ws_reader_err[{tag}]", err=str(e)[:90])
+        finally:
+            # A normal (1000) close ends `async for` WITHOUT raising - only
+            # abnormal closes surface as exceptions - so record the close here
+            # from the connection itself. close_code is None while the socket
+            # is still open (e.g. a transient decode error broke the loop).
+            if ws.close_code is not None:
+                self._log(self.name, f"ws_closed[{tag}]",
+                          code=ws.close_code, reason=ws.close_reason)
+                if ws is self.ws:
+                    self.closed_at = time.time()
+                    self.close_info = (ws.close_code, ws.close_reason)
 
     async def _keepaliver(self):
         while True:
@@ -162,14 +173,32 @@ class SyncPlayClient:
     # --- time sync (protocol v2, WebSocket) -----------------------------
 
     async def timesync_ws(self, timeout=5):
-        """One NTP exchange over the socket. Returns (offset_ms, rtt_ms, data)."""
+        """One NTP exchange over the socket. Returns (offset_ms, rtt_ms, data).
+
+        Raises ConnectionError if the server closes the socket in response to
+        the probe (some servers, stock Jellyfin included, reject an unknown
+        message type by tearing the connection down) and TimeoutError if it
+        stays connected but never answers."""
         t0 = int(time.time() * 1000)
         sent_at = time.time()
-        await self.ws.send(json.dumps({"MessageType": "TimeSync", "Data": t0}))
-        t, d = await self.wait_for("TimeSync", timeout=timeout, after=sent_at - 0.001)
-        if not d or d.get("T0") != t0:
+        try:
+            await self.ws.send(json.dumps({"MessageType": "TimeSync", "Data": t0}))
+        except websockets.ConnectionClosed as e:
+            raise ConnectionError(f"{e.code} {e.reason or 'no reason'}")
+
+        d, t_recv = None, None
+        deadline = time.time() + timeout
+        while d is None and time.time() < deadline:
+            tc, cand = await self.wait_for("TimeSync", timeout=0.2, after=sent_at - 0.001)
+            if cand and cand.get("T0") == t0:
+                d, t_recv = cand, tc
+            elif self.closed_at and self.closed_at >= sent_at:
+                code, reason = self.close_info or (None, None)
+                raise ConnectionError(f"{code} {reason or 'no reason'}")
+        if d is None:
             raise TimeoutError("no TimeSync response")
-        t3 = t * 1000
+
+        t3 = t_recv * 1000
         rtt = (t3 - d["T0"]) - (d["T2"] - d["T1"])
         offset = ((d["T1"] - d["T0"]) + (d["T2"] - t3)) / 2
         return offset, rtt, d
