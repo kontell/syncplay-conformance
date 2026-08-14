@@ -203,6 +203,43 @@ class SyncPlayClient:
         offset = ((d["T1"] - d["T0"]) + (d["T2"] - t3)) / 2
         return offset, rtt, d
 
+    async def timesync_transport(self):
+        """Capability probe (POST /SyncPlay/Hello): a plugin-binding server
+        (SYNCPLAY.md plugin appendix) advertises a dedicated WebSocket path for
+        the TimeSync exchange, because a plugin cannot answer TimeSync on the
+        shared /socket. Returns that path, or None when TimeSync is served on
+        /socket (integrated v2 servers) or the server is v1 (404)."""
+        r = await self.session.post(f"{self.base}/SyncPlay/Hello", json={"ProtocolVersion": 2})
+        if r.status != 200:
+            await r.text()
+            return None
+        try:
+            body = await r.json()
+        except Exception:
+            return None
+        return (body.get("TimeSync") or {}).get("WebSocketPath")
+
+    async def timesync_ws_dedicated(self, path, timeout=5):
+        """One NTP exchange over the server's dedicated time-sync socket."""
+        url = f"{self.ws_base}{path}"
+        ws = await websockets.connect(url, additional_headers={"Authorization": self.auth})
+        try:
+            t0 = int(time.time() * 1000)
+            await ws.send(json.dumps({"MessageType": "TimeSync", "Data": t0}))
+            raw = await asyncio.wait_for(ws.recv(), timeout)
+            d = (json.loads(raw) or {}).get("Data") or {}
+            if d.get("T0") != t0:
+                raise TimeoutError("unmatched TimeSync response")
+            t3 = time.time() * 1000
+            rtt = (t3 - d["T0"]) - (d["T2"] - d["T1"])
+            offset = ((d["T1"] - d["T0"]) + (d["T2"] - t3)) / 2
+            return offset, rtt, d
+        finally:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
     # --- message inspection ---------------------------------------------
 
     async def wait_for(self, mtype, sub=None, timeout=10, after=0.0, sink=None):

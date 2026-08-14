@@ -46,23 +46,33 @@ async def state_version(ctx):
 
 
 async def ws_timesync(ctx):
-    """The TimeSync WebSocket exchange echoes T0 and returns sane T1/T2."""
+    """The TimeSync WebSocket exchange echoes T0 and returns sane T1/T2.
+
+    Transport discovery first: a plugin-binding server advertises a dedicated
+    time-sync socket via POST /SyncPlay/Hello (it cannot answer TimeSync on
+    the shared /socket); an integrated v2 server answers on /socket itself."""
     c = await ctx.new_client(0)
+    where = "/socket"
     try:
-        offset, rtt, d = await c.timesync_ws()
+        path = await c.timesync_transport()
+        if path:
+            where = f"dedicated {path}"
+            offset, rtt, d = await c.timesync_ws_dedicated(path)
+        else:
+            offset, rtt, d = await c.timesync_ws()
     except ConnectionError as e:
         ctx.check("WebSocket TimeSync", False,
                   f"server closed the socket on the TimeSync probe ({e}) - it rejects unknown "
                   "WS message types (stock Jellyfin <=10.11); no protocol v2 time sync")
         return
     except TimeoutError:
-        ctx.check("WebSocket TimeSync", False, "no TimeSync response within 5s (socket stayed open)")
+        ctx.check("WebSocket TimeSync", False, f"no TimeSync response within 5s ({where})")
         return
     ctx.check(
         "WebSocket TimeSync",
         d["T1"] <= d["T2"] and 0 <= rtt < 2000,
-        f"rtt={rtt:.1f}ms offset={offset:.1f}ms (offset vs local clock; large values "
-        f"are fine on remote servers, negative rtt is not)")
+        f"rtt={rtt:.1f}ms offset={offset:.1f}ms via {where} (offset vs local clock; large "
+        f"values are fine on remote servers, negative rtt is not)")
 
 
 async def position_beacons(ctx):
