@@ -46,23 +46,33 @@ async def state_version(ctx):
 
 
 async def ws_timesync(ctx):
-    """The TimeSync WebSocket exchange echoes T0 and returns sane T1/T2."""
+    """The TimeSync WebSocket exchange echoes T0 and returns sane T1/T2.
+
+    Transport discovery first: a plugin-binding server advertises a dedicated
+    time-sync socket via POST /SyncPlay/Hello (it cannot answer TimeSync on
+    the shared /socket); an integrated v2 server answers on /socket itself."""
     c = await ctx.new_client(0)
+    where = "/socket"
     try:
-        offset, rtt, d = await c.timesync_ws()
+        path = await c.timesync_transport()
+        if path:
+            where = f"dedicated {path}"
+            offset, rtt, d = await c.timesync_ws_dedicated(path)
+        else:
+            offset, rtt, d = await c.timesync_ws()
     except ConnectionError as e:
         ctx.check("WebSocket TimeSync", False,
                   f"server closed the socket on the TimeSync probe ({e}) - it rejects unknown "
                   "WS message types (stock Jellyfin <=10.11); no protocol v2 time sync")
         return
     except TimeoutError:
-        ctx.check("WebSocket TimeSync", False, "no TimeSync response within 5s (socket stayed open)")
+        ctx.check("WebSocket TimeSync", False, f"no TimeSync response within 5s ({where})")
         return
     ctx.check(
         "WebSocket TimeSync",
         d["T1"] <= d["T2"] and 0 <= rtt < 2000,
-        f"rtt={rtt:.1f}ms offset={offset:.1f}ms (offset vs local clock; large values "
-        f"are fine on remote servers, negative rtt is not)")
+        f"rtt={rtt:.1f}ms offset={offset:.1f}ms via {where} (offset vs local clock; large "
+        f"values are fine on remote servers, negative rtt is not)")
 
 
 async def position_beacons(ctx):
@@ -233,3 +243,83 @@ async def grace_expiry(ctx):
         "grace expiry removes member",
         left is not None and 130 <= left_dt <= 180 and m is None,
         f"UserLeft +{left_dt and format(left_dt, '.1f')}s (expect ~150s), still a member={m is not None}")
+
+
+async def hot_join(ctx):
+    """[plugin binding] A v2 member joining a Playing group does not pause it:
+    existing members receive no command and no Waiting state, the group stays
+    Playing throughout, and the joiner rendezvouses via a private scheduled
+    Unpause at the group's live position. A v1 joiner still gets the classic
+    barrier."""
+    clients, gid, cmd = await start_playing(ctx, [2, 2])
+    a, b = clients
+    t0 = time.time()
+
+    # --- v2 joiner: nobody is interrupted --------------------------------
+    c = await ctx.new_client(2)
+    await c.post("/SyncPlay/Join", {"GroupId": gid, "ProtocolVersion": 2})
+    _, snap = await c.wait_for("SyncPlayGroupUpdate", "StateSnapshot", 6, after=t0)
+    sd = (snap or {}).get("Data") or {}
+    ctx.check(
+        "hot join: snapshot pushed to the joiner",
+        bool(snap) and sd.get("State") == "Playing",
+        f"snapshot={bool(snap)} state={sd.get('State')}")
+
+    playlist = (sd.get("PlayQueue") or {}).get("Playlist") or []
+    if playlist:
+        c.playlist_item_id = playlist[0]["PlaylistItemId"]
+    await c.ready(sd.get("PositionTicks") or 0)
+
+    t_up, up = await c.wait_command("Unpause", t0, timeout=6)
+    lead_s = None
+    if up:
+        # Server-stamped lead, no client clock involved: how far ahead of
+        # emission the start is scheduled. parse_iso_ms yields unix seconds.
+        lead_s = parse_iso_ms(up["When"]) - parse_iso_ms(up["EmittedAt"])
+    ctx.check(
+        "hot join: private scheduled Unpause to the joiner",
+        up is not None and lead_s is not None and 0.4 <= lead_s <= 5.0,
+        f"unpause={up is not None} scheduled lead={lead_s is not None and format(lead_s * 1000, '.0f')}ms")
+
+    def commands_since(client, name):
+        return [d for t, mt, d in client.msgs
+                if mt == "SyncPlayCommand" and t > t0 and d.get("Command") == name]
+
+    def waits_since(client):
+        return [d for t, mt, d in client.msgs
+                if mt == "SyncPlayGroupUpdate" and t > t0
+                and d.get("Type") == "StateUpdate"
+                and (d.get("Data") or {}).get("State") == "Waiting"]
+
+    quiet = (
+        not commands_since(a, "Pause") and not commands_since(b, "Pause")
+        and not commands_since(a, "Unpause") and not commands_since(b, "Unpause")
+        and not waits_since(a) and not waits_since(b))
+    ctx.check(
+        "hot join: existing members uninterrupted",
+        quiet,
+        "pauses a/b=%d/%d unpauses=%d/%d waits=%d/%d (all must be 0)" % (
+            len(commands_since(a, "Pause")), len(commands_since(b, "Pause")),
+            len(commands_since(a, "Unpause")), len(commands_since(b, "Unpause")),
+            len(waits_since(a)), len(waits_since(b))))
+
+    await asyncio.sleep(1)
+    g, m = await member_of(a, c.user)
+    ctx.check(
+        "hot join: group stayed Playing, joiner synced",
+        g.get("State") == "Playing" and bool(m) and m.get("IsBuffering") is False,
+        f"state={g.get('State')} member={bool(m)} buffering={m and m.get('IsBuffering')}")
+
+    # --- v1 joiner control: the classic barrier still applies ------------
+    await c.post("/SyncPlay/Leave")
+    await asyncio.sleep(1)
+    # The body sniffer remembered ProtocolVersion 2 for this device; an
+    # explicit Hello downgrade makes the next join a v1 membership.
+    await c.post("/SyncPlay/Hello", {"ProtocolVersion": 1})
+    t1 = time.time()
+    await c.post("/SyncPlay/Join", {"GroupId": gid})
+    _, pause = await a.wait_command("Pause", t1, timeout=8)
+    ctx.check(
+        "v1 join still uses the barrier",
+        pause is not None,
+        f"Pause to existing members={pause is not None}")

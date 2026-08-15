@@ -63,6 +63,7 @@ python -m syncplay_kit bootstrap --base http://127.0.0.1:8097 \
 | `snapshot_on_demand` | fast | `POST /SyncPlay/Snapshot` (§5.4) |
 | `resync_per_version` | fast | resync payload per protocol version (§9) |
 | `adaptive_tolerance` | fast | ping-scaled tolerance (§8) |
+| `hot_join` | fast | v2 joiner never pauses a Playing group (§7.1) |
 | `reconnect_grace` | slow | disconnect ≠ kick; snapshot on reconnect (§9) |
 | `grace_expiry` | slow | removal after the 90s window (§9) |
 
@@ -106,6 +107,9 @@ build. Sketch (GitHub Actions):
 ## Compatibility
 
 Scenarios marked v2 in the table require a server implementing SyncPlay
-protocol v2 (`docs/SYNCPLAY.md`). Against a v1-only server, run the phase-0
+protocol v2 — the specification lives in this repository at
+`docs/SYNCPLAY.md`. `hot_join` additionally requires a server implementing
+§7.1 (the SyncPlay v2 plugin ≥ 10.11.0.2; the integrated fork barriers every
+joiner and fails it by design). Against a v1-only server, run the phase-0
 subset: `group_wait_deadline`, `buffering_grace_*` require the robustness
 patches; stock 10.x servers fail them by design (that is the point).

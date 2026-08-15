@@ -26,6 +26,7 @@ SCENARIOS = [
     Scenario("snapshot_on_demand", protocol_v2.snapshot_on_demand, "fast", 2, 90),
     Scenario("resync_per_version", protocol_v2.resync_per_version, "fast", 2, 90),
     Scenario("adaptive_tolerance", protocol_v2.adaptive_tolerance, "fast", 2, 120),
+    Scenario("hot_join", protocol_v2.hot_join, "fast", 3, 120),
     Scenario("reconnect_grace", protocol_v2.reconnect_grace, "slow", 2, 240),
     Scenario("grace_expiry", protocol_v2.grace_expiry, "slow", 2, 300),
 ]
