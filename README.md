@@ -28,7 +28,7 @@ Against an existing server with two or three test users:
 ```bash
 python -m syncplay_kit run \
     --base http://127.0.0.1:8096 \
-    --user syncbot-a:sp-test --user syncbot-b:sp-test --user admin:admin-pw \
+    --user user-1:pw-1 --user user-2:pw-2 --user user-3:pw-3 \
     --suite all
 ```
 
