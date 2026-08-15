@@ -1,7 +1,8 @@
 # SyncPlay protocol specification
 
 **Protocol versions covered:** 1 (Jellyfin 10.6+) and 2 (this specification).
-**Status:** draft, describes the server behaviour implemented in this repository.
+**Status:** draft; describes the behaviour enforced by this repository's
+conformance suite (§13).
 
 SyncPlay keeps media playback synchronized across a group of sessions. The
 server maintains authoritative group state and schedules playback commands
@@ -23,12 +24,12 @@ Three planes, two transports:
 |---|---|---|---|
 | Control | REST `POST /SyncPlay/*` | client → server | join/leave, playback requests, reports |
 | Feedback | WebSocket `/socket` | server → client | commands, group updates, snapshots, beacons |
-| Time | REST `GET /GetUtcTime` (v1), WebSocket `TimeSync` (v2) | round trip | clock offset + RTT measurement |
+| Time | REST `GET /GetUtcTime` (v1), WebSocket `TimeSync` (v2, transport discovered per §2.1/§3.1) | round trip | clock offset + RTT measurement |
 
 The feedback plane is **mandatory**: a client that can reach the REST API but
 not the WebSocket can join groups but will never receive a command. Operators
-must proxy WebSocket upgrades correctly (see `docs/operators.md` in the
-conformance kit); clients SHOULD detect a dead feedback plane (no message of
+must proxy WebSocket upgrades correctly (see `docs/operators.md`); clients
+SHOULD detect a dead feedback plane (no message of
 any kind within 120s) and surface it rather than fail silently.
 
 ### Conventions
@@ -58,6 +59,33 @@ any kind within 120s) and surface it rather than fail silently.
   server support, or unconditionally (unknown JSON fields are ignored by older
   servers) while treating the absence of `GroupInfoDto.ProtocolVersion` as v1.
 
+### 2.1 Capability probe: `POST /SyncPlay/Hello`
+
+One round trip answers "does this server speak v2, and where does time sync
+live?" — and registers the caller's version at the same time:
+
+- Request body: `{"ProtocolVersion": <int>}`. **The body is load-bearing**: the
+  requested version is registered for the calling device, superseding any
+  earlier registration — and an absent body registers version **1**, silently
+  downgrading the device.
+- Response: `{"ProtocolVersion": <highest supported>, "PluginVersion":
+  "<implementation version>", "TimeSync": {"WebSocketPath":
+  "/SyncPlay/TimeSync"}}`. A present `TimeSync.WebSocketPath` names a dedicated
+  time-sync socket (§3.1); absent means the main `/socket` answers `TimeSync`.
+- **404 means the route does not exist.** That is how stock v1 servers answer —
+  but also how a v2 server *without* the `Hello` binding answers (the
+  integrated-fork implementation), so 404 means "no capability document", not
+  "no v2": fall back to the §2 body negotiation and `GroupInfoDto` detection,
+  and do not use a dedicated time-sync socket.
+
+`Hello` and the `New`/`Join` bodies write the same per-device version record;
+the most recent write wins, downgrades included. This makes `Hello` the
+out-of-group (re)negotiation path: a device can switch itself to v1
+(`{"ProtocolVersion": 1}`) or back before its next join, without joining.
+
+**Client requirement:** probe `Hello` once per server connection before using
+any v2 transport, and always send the version you intend to speak.
+
 ## 3. Time synchronization
 
 Clients convert between local and server time using an offset estimated from
@@ -76,7 +104,28 @@ Sources:
 - **v2 (WebSocket):** send `{"MessageType": "TimeSync", "Data": <t0 unix ms>}`;
   the server replies `{"MessageType": "TimeSync", "Data": {"T0": <echo>, "T1":
   <receive ms>, "T2": <transmit ms>}}`. Match responses to requests by the T0
-  echo. A TimeSync exchange also counts as a keep-alive.
+  echo.
+
+### 3.1 Where the v2 exchange runs
+
+Two bindings exist; discover which one the server offers via `Hello` (§2.1):
+
+- **Dedicated socket** (`TimeSync.WebSocketPath` present — the plugin
+  implementation): connect a separate authenticated WebSocket to that path.
+  `TimeSync` is the only message type it speaks; a synchronous send→recv round
+  trip per measurement is sufficient, and stamping t3 at `recv()` keeps
+  notification buses out of the measurement path. This socket carries no group
+  feedback, and its traffic does **not** keep the main `/socket` alive — the
+  main socket still needs its own `KeepAlive`s (§5.5).
+- **Main socket** (no `WebSocketPath` — the integrated implementation): the
+  `/socket` feedback connection answers `TimeSync` directly, and the exchange
+  doubles as a keep-alive (§5.5).
+
+**Never probe by sending `TimeSync` blind on the main socket.** Current stock
+servers tear down the entire WebSocket on any message type they cannot parse
+(an error-path bug in the connection handler), taking the feedback plane with
+it. Discovery through `Hello` exists precisely so the shared socket is never
+put at risk.
 
 **Client requirement:**
 
@@ -197,7 +246,8 @@ periodically; clients MUST send `{"MessageType": "KeepAlive"}` at no more than
 half that interval (the server answers with `KeepAlive`). A socket that misses
 keep-alives is aborted by the server (~60s), which ends the session when it was
 the last socket — see §9 for what that means for group membership. v2 clients
-using periodic `TimeSync` exchanges thereby also satisfy keep-alive.
+using periodic `TimeSync` exchanges on the **main-socket binding** (§3.1)
+thereby also satisfy keep-alive; dedicated-socket traffic does not count.
 
 ## 6. State versioning (v2)
 
@@ -223,8 +273,9 @@ emit several messages).
 ## 7. Group state machine
 
 States: `Idle`, `Waiting`, `Playing`, `Paused`. `Waiting` is the barrier
-state: entered on queue changes, seeks, joins during playback, and buffering;
-left when no member is still expected (`IsBuffering && !IgnoreGroupWait`).
+state: entered on queue changes, seeks, joins during playback (v1 joiners —
+v2 joiners hot-join instead, §7.1), and buffering; left when no member is
+still expected (`IsBuffering && !IgnoreGroupWait`).
 
 - **Ready gating.** After loading/seeking, a client reports `Ready` with its
   actual position and play state. The server compares the (extrapolated)
@@ -246,6 +297,34 @@ left when no member is still expected (`IsBuffering && !IgnoreGroupWait`).
   chronically slow members become spectators, but reintegrate by reporting.
 - **Spectators.** `SetIgnoreWait {IgnoreWait: true}` opts a member out of
   being waited on; it still receives all commands.
+
+### 7.1 Hot join (v2)
+
+A v2 member joining a group that is `Playing` does not drag it into `Waiting`
+(servers gate this behind configuration — the plugin's `HotJoin`, default on):
+
+- The joiner is admitted flagged as buffering and not-waited-on; the group
+  stays `Playing`. Existing members see `UserJoined` and the membership
+  update, and nothing else — no `Pause`, no `Unpause`, no state change.
+- The server pushes the joiner a `StateSnapshot` (§5.4) carrying the live
+  position; the joiner loads it and reports `Buffering`/`Ready` as usual. Its
+  `Buffering` reports are absorbed without group effect.
+- Its `Ready` is answered with a **private scheduled `Unpause`**:
+  `When = now + max(2 × member ping, 500ms)`, `PositionTicks` extrapolated to
+  `When` — under the §5.1 execution rules the joiner starts exactly where the
+  group will be at that instant. Nothing is sent to anyone else.
+- If the group leaves `Playing` before the joiner reports ready, the hot join
+  is abandoned and the ordinary rules of §7 apply from the new state.
+
+v1 joiners keep the classic barrier: the group enters `Waiting` as above.
+
+**Client requirement (v2):** no new message handling is needed — a client
+correctly implementing §5.1, §5.4 and §7 hot-joins unmodified. For a tight
+arrival a client SHOULD seek to the command's exact `PositionTicks` when
+*arming* the scheduled `Unpause` rather than starting and correcting
+afterwards (§10): the private start is the joiner's only synchronization
+point, and the same arm-time alignment equally tightens ordinary group
+restarts after a barrier.
 
 ## 8. Position tolerance
 
@@ -314,6 +393,7 @@ never change play state.
 | Report extrapolation limit (`TimeSyncOffset`) | 2000ms | server |
 | Position tolerance | clamp(2×ping, 500ms, 2000ms) | server |
 | Unpause scheduling delay | max(2 × highest ping, 500ms) | server |
+| Hot-join private start lead | max(2 × member ping, 500ms) | server |
 | Buffering grace period | 2s | server |
 | Group-wait deadline | 10s | server |
 | Disconnect grace window | 90s | server |
@@ -321,13 +401,23 @@ never change play state.
 | Sweep resolution | 1s | server |
 | Time sync window / cadence | best-of-8, 60s (greedy 1s ×3 on join) | client |
 | Correction dead zone / rate cap / seek threshold | 60ms / ±5% / 1500ms | client |
+| Scheduled-start arm-time alignment band (§7.1) | 100ms | client |
 | Auto-rejoin rate limit | 30s | client |
 | Snapshot request rate limit | 5s | client |
 
 ## 13. Conformance
 
-A protocol conformance kit (fake clients driving a real server, with fault
-injection: zombie sockets, clean drops, delayed readies, biased clocks) lives
-in the `syncplay-conformance` repository. Server changes touching SyncPlay
-should pass its full suite; client implementations can reuse its Python
-reference client core.
+This repository is the conformance kit: fake clients driving a real server,
+with fault injection (zombie sockets, clean drops, delayed readies, biased
+clocks). The scenario table in the README maps each scenario to the section
+it verifies. Server changes touching SyncPlay should pass the full suite;
+client implementations can reuse the kit's Python reference client core.
+
+Known conforming implementations:
+
+| Implementation | Role | Protocol |
+|---|---|---|
+| `kontell/jellyfin-plugin-syncplayv2` on stock Jellyfin 10.11 | server | v1 + v2; `Hello`/dedicated socket; hot join from 10.11.0.2 |
+| `kontell/jellyfin` `integration/syncplay-phase1` | server | v1 + v2; main-socket bindings only (no `Hello`, no hot join) |
+| `kontell/plugin.video.kofin` ≥ 0.16.0 | client | v2 |
+| jellyfin-web (stock) | client | v1 |
