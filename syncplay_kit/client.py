@@ -203,6 +203,28 @@ class SyncPlayClient:
         offset = ((d["T1"] - d["T0"]) + (d["T2"] - t3)) / 2
         return offset, rtt, d
 
+    async def hello(self, protocol_version=2, capabilities=None):
+        """POST /SyncPlay/Hello: register version (and capabilities, §14.1)
+        for this device; returns the capability document, or None on 404."""
+        body = {"ProtocolVersion": protocol_version}
+        if capabilities is not None:
+            body["Capabilities"] = capabilities
+        r = await self.session.post(f"{self.base}/SyncPlay/Hello", json=body)
+        if r.status != 200:
+            await r.text()
+            return None
+        try:
+            return await r.json()
+        except Exception:
+            return None
+
+    async def set_new_queue_ex(self, entries, position=0, start_ticks=0):
+        """POST /SyncPlay/SetNewQueueEx (§14.2): entries are {"ItemId": guid}
+        or {"Content": {...}} dicts, passed through verbatim."""
+        return await self.post("/SyncPlay/SetNewQueueEx", {
+            "PlayingQueue": entries, "PlayingItemPosition": position,
+            "StartPositionTicks": int(start_ticks)})
+
     async def timesync_transport(self):
         """Capability probe (POST /SyncPlay/Hello): a plugin-binding server
         (SYNCPLAY.md plugin appendix) advertises a dedicated WebSocket path for

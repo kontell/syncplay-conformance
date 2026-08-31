@@ -485,6 +485,7 @@ never change play state.
 | Load-ahead allowance (§10) | previous load, smoothed 50/50, 250ms floor, 15s ceiling | client |
 | Auto-rejoin rate limit | 30s | client |
 | Snapshot request rate limit | 5s | client |
+| External-content entry caps (§14) | provider `[a-z0-9][a-z0-9._-]{1,39}`, key ≤512, name ≤256, image URL ≤1024, runtime ≥0, ≤200 entries/request | server |
 
 ## 13. Conformance
 
@@ -498,7 +499,7 @@ Known conforming implementations:
 
 | Implementation | Role | Protocol |
 |---|---|---|
-| `kontell/jellyfin-plugin-syncplayv2` on stock Jellyfin 10.11 / 12 | server | v1 + v2; `Hello`/dedicated socket; hot join from 10.11.0.2; rendezvous from 10.11.0.4 |
+| `kontell/jellyfin-plugin-syncplayv2` on stock Jellyfin 10.11 / 12 | server | v1 + v2; `Hello`/dedicated socket; hot join from 10.11.0.2; rendezvous from 10.11.0.4; external content (§14) from 10.11.0.8 |
 | `kontell/jellyfin` `integration/syncplay-phase1` | server | v1 + v2; main-socket bindings only (no `Hello`, no hot join, no rendezvous) |
 | `kontell/plugin.video.kofin` ≥ 0.16.0 | client | v2; §10 load-ahead allowance from 0.19.0 |
 | jellyfin-web (stock) | client | v1 |
@@ -509,3 +510,88 @@ releases (§2.1).
 
 Rendezvous (§7.2) has no scenario yet: the suite covers the deadline it fires
 at, but only the v1 outcome of it.
+
+## 14. External content (v2 capability: `ExternalContent`)
+
+SyncPlay's group machinery — barriers, tolerances, scheduled starts, beacons,
+snapshots — never reads media; only queue identity ties it to the server's
+library. This capability unties that: a queue entry may name **content the
+server does not host**, identified by an opaque `Provider:Key` pair that only
+the members resolve. The server carries the descriptor and its runtime and
+validates nothing beyond shape — resolvability is deliberately the members'
+problem, exactly as a library item a member's transport cannot play already
+is. (Motivation and the Kodi client architecture:
+`plugin.video.kofin/docs/syncplay-generic-backend-feasibility.md`.)
+
+### 14.1 Negotiation
+
+The `Hello` body (§2.1) gains `"Capabilities": ["ExternalContent"]`; the
+response advertises the server's own list the same way. The declaration is
+per device, rides beside the registered protocol version, and follows the
+same semantics: the most recent `Hello` wins, withdrawals included. A version
+re-registration without a body (§2's `New`/`Join` negotiation) preserves the
+capability — it carries no capability field, so it cannot withdraw one.
+
+**Client requirement:** declare the capability only if the client can resolve
+external entries into playback (or refuse them gracefully per §14.4); a
+declaration is a promise the server's visibility rules rely on.
+
+### 14.2 Requests
+
+`POST /SyncPlay/SetNewQueueEx` and `POST /SyncPlay/QueueEx` mirror their
+stock counterparts with per-entry shape (`PlayingQueue` / `Entries`):
+
+```json
+{"ItemId": "<library item guid>"}
+{"Content": {"Provider": "youtube", "Key": "dQw4w9WgXcQ",
+             "Name": "…", "RunTimeTicks": 21200000000, "ImageUrl": "…"}}
+```
+
+Exactly one of `ItemId`/`Content` per entry; mixed queues are legal. Caps are
+in §12; any invalid entry refuses the whole request with a 400 naming it.
+`RunTimeTicks` 0 (or absent) means unknown or unbounded — a live stream — and
+disables the server's position clamp for that item instead of clamping every
+report to 0.
+
+### 14.3 The wire
+
+Descriptor entries travel the queue as **sentinel item ids**: fresh random
+GUIDs, never library items, meaningless outside the group. For members whose
+device declared the capability, `PlayQueue` updates and the snapshot's queue
+carry the descriptor per entry — `{ItemId, PlaylistItemId, Content: {…}}` —
+and entries without one omit `Content` entirely, so the shape is
+byte-compatible with §5.3 for pure-library queues. Members without the
+capability are never sent a descriptor queue at all (§14.4). Everything else
+on the wire — commands, reports, `NextItem`, beacons — is unchanged and keyed
+by `PlaylistItemId` as before.
+
+### 14.4 Access and visibility
+
+The capability is the access check for content the server cannot resolve,
+mirroring the library rule ("every member must access every queue item"):
+
+- Setting or appending a descriptor queue is refused unless **every current
+  member's device** declared the capability (silently, like a failed library
+  access check: 204, no queue update).
+- A group whose queue holds any descriptor entry is **invisible** to devices
+  without the capability (`List`, `GetGroup`) and unjoinable (the join is
+  answered with `LibraryAccessDenied`) — the same UX stock gives a queue a
+  user cannot resolve, and what keeps v1 clients (jellyfin-web positionally
+  corrupts its queue mapping on unknown ids) from ever seeing a sentinel.
+
+**Client requirement:** resolve an entry carrying `Content` by its
+`Provider:Key`, never by its `ItemId`; treat an unresolvable provider as a
+graceful refusal (leave or spectate with a message), not an error loop; and
+expect a runtime-0 item to accept seeks and reports at any position.
+
+## 15. Plugin-version floors
+
+| Feature | First build |
+|---|---|
+| Hot join (§7.1) | 10.11.0.2 |
+| Rendezvous (§7.2) | 10.11.0.4 |
+| Null-guarded queue lookups, runtime-0 unbounded (§14.2 semantics) | 10.11.0.7 |
+| External content (§14) | 10.11.0.8 |
+
+Builds are named here by the Jellyfin 10.11 line; §2.1's ordering rule maps
+them to the 12.x line (`12.0.0.N` is the same code as `10.11.0.N`).
