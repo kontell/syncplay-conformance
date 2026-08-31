@@ -120,3 +120,4 @@ multiplexing. Two caveats:
 | Members drop out of groups every minute or two | proxy idle timeout | `idle survival` FAIL |
 | One remote member constantly stalls/gets corrected | clock offset from queueing | `offset asymmetry` WARN |
 | Everything works on LAN, breaks remotely | any of the above; different URLs | run doctor against the public URL |
+| One transcoding member stalls the group on every seek, then plays on adrift | not the deployment: server plugin older than 10.11.0.4 (rendezvous, spec §7.2), or a client without the §10 load allowance | n/a — check versions |
