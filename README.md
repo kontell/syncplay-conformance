@@ -71,6 +71,12 @@ Scenarios are fully isolated: each uses fresh device ids (fresh server
 sessions) and its own group, so leftover state from aborted runs cannot bleed
 in.
 
+Not yet covered: **rendezvous** (§7.2), where a v2 member the group has given
+up waiting for is pushed a snapshot and given a private scheduled start.
+`group_wait_deadline` fires the deadline it hangs off and still passes — the
+group proceeds and the member is flagged either way — but asserts only the v1
+outcome of it.
+
 ## Operator self-test
 
 `tools/doctor.py` checks a *deployment* rather than a server build: WebSocket
@@ -113,3 +119,9 @@ protocol v2 — the specification lives in this repository at
 joiner and fails it by design). Against a v1-only server, run the phase-0
 subset: `group_wait_deadline`, `buffering_grace_*` require the robustness
 patches; stock 10.x servers fail them by design (that is the point).
+
+Plugin version floors name the Jellyfin 10.11 build. One source tree ships
+against several server ABIs and only the fourth component distinguishes
+releases, so `12.0.0.4` (Jellyfin 12) is the same code as `10.11.0.4` — see
+§2.1 before comparing the string. Rendezvous (§7.2) lands in 10.11.0.4;
+10.11.0.3 shipped it on a branch that measurement showed is never reached.

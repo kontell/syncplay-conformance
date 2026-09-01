@@ -72,6 +72,12 @@ live?" — and registers the caller's version at the same time:
   "<implementation version>", "TimeSync": {"WebSocketPath":
   "/SyncPlay/TimeSync"}}`. A present `TimeSync.WebSocketPath` names a dedicated
   time-sync socket (§3.1); absent means the main `/socket` answers `TimeSync`.
+- **`PluginVersion` is not ordered across server lines.** An implementation may
+  build one source tree against several Jellyfin ABIs, stamping each build
+  `<server major>.<server minor>.0.<build>` — the plugin does, so `12.0.0.4`
+  and `10.11.0.4` are the same code and only the fourth component identifies
+  the feature set. Compare that component, or nothing: a client that sorts the
+  whole version string reads a Jellyfin 12 build as far newer than it is.
 - **404 means the route does not exist.** That is how stock v1 servers answer —
   but also how a v2 server *without* the `Hello` binding answers (the
   integrated-fork implementation), so 404 means "no capability document", not
@@ -239,6 +245,11 @@ received: a `GroupJoined` (group info), a `PlayQueue` update, and a synthetic
 command (`Unpause` if `IsPlaying`, `Stop` if `State == "Idle"`, else `Pause`)
 at `When`/`PositionTicks`. Snapshot application MUST be idempotent.
 
+A snapshot is not only a join artefact. The server also pushes one unsolicited,
+mid-group and mid-playback, to a member it has stopped waiting for (§7.2), so a
+client must accept one in any state — including while it believes itself in
+sync.
+
 ### 5.5 Keep-alives and liveness
 
 The server sends `ForceKeepAlive` with a timeout value on connect and
@@ -295,6 +306,10 @@ still expected (`IsBuffering && !IgnoreGroupWait`).
   internal timeout mark) and the group proceeds without it. The flag clears
   automatically the next time one of the member's reports is processed —
   chronically slow members become spectators, but reintegrate by reporting.
+  A **v2** member is *rendezvoused* at the deadline instead (§7.2): the group
+  proceeds exactly as above, but the member is given the means to catch up
+  rather than left where it stood. v1 members are flagged and abandoned as
+  described.
 - **Spectators.** `SetIgnoreWait {IgnoreWait: true}` opts a member out of
   being waited on; it still receives all commands.
 
@@ -318,6 +333,10 @@ A v2 member joining a group that is `Playing` does not drag it into `Waiting`
 
 v1 joiners keep the classic barrier: the group enters `Waiting` as above.
 
+Nothing in those three steps — snapshot, absorbed `Buffering`, private
+scheduled `Unpause` — is specific to joining. They are equally how a server
+recovers a member it has given up waiting for (§7.2).
+
 **Client requirement (v2):** no new message handling is needed — a client
 correctly implementing §5.1, §5.4 and §7 hot-joins unmodified. For a tight
 arrival a client SHOULD seek to the command's exact `PositionTicks` when
@@ -325,6 +344,51 @@ arrival a client SHOULD seek to the command's exact `PositionTicks` when
 afterwards (§10): the private start is the joiner's only synchronization
 point, and the same arm-time alignment equally tightens ordinary group
 restarts after a barrier.
+
+### 7.2 Rendezvous (v2)
+
+Some members cannot be corrected into position. A transcoding client asked to
+seek lands on the segment boundary its transport chose rather than the position
+the group asked for, reports back still out of tolerance, and the server seeks it again.
+Measured on a real deployment: four rounds, ~13s of the whole group held in
+`Waiting`, and the member played on permanently adrift anyway.
+
+Such a member is not late — its transport cannot express the position being
+asked for — which puts it in exactly the position of one that has just walked
+in. The server therefore hands it to the hot-join path of §7.1, a
+**rendezvous**: the group stops waiting and carries on, the member is pushed a
+`StateSnapshot` to reload from, its `Buffering` reports are absorbed, and its
+next `Ready` is answered with the private scheduled `Unpause` at the live
+position. Other members see the membership update and nothing else. Completing
+the rendezvous clears the flags, so the member is waited on again from its next
+report — the reintegration rule of §7, reached by reporting as usual.
+
+Rendezvous is v2-only and gated on the same configuration as hot join (the
+plugin's `HotJoin`): a v1 member cannot be told about snapshots or private
+starts, so §7 abandonment remains all there is to do for it.
+
+Two things trigger it:
+
+- **The group-wait deadline** (§7) — the trigger that fires for the member this
+  exists for. A client whose reload cycle is 6-7s answers a group `Seek` with a
+  single correction, the 10s deadline arrives, and its next report lands after
+  the group has already left `Waiting`.
+- **Corrections that are not converging**, while the group is still `Waiting`.
+  The first correction always gets its chance: most members are simply late and
+  one seek fixes them. After that the server rendezvouses when a correction
+  fails to close the gap by **250ms**, or on the **third** attempt, whichever
+  comes first. Improvement is absolute — 3s behind becoming 3s ahead is the
+  same gap, overshot — which is how a livelock would otherwise hide. The
+  counters reset whenever the member stops buffering.
+
+If the rendezvoused member was the only one the group was waiting on, the group
+is released as though it had reported ready.
+
+**Client requirement (v2):** none beyond §7.1 — a rendezvous *is* a hot join
+and arrives as one. A client that serves the reload by restarting its stream
+SHOULD aim that load ahead of the group by the load's own cost (§10), or it
+lands exactly as far behind as the reload took and the rendezvous buys it
+nothing.
 
 ## 8. Position tolerance
 
@@ -374,6 +438,20 @@ not buffering: estimate the server position
 Clients whose runtime throttles timers in the background (browsers) MUST
 re-check drift immediately when returning to the foreground.
 
+**Client requirement** where a correction or a scheduled start is served by
+*reloading* the stream rather than seeking it — a transcoded stream cannot seek
+accurately, so a reload is the only way to reach a position: aim the load ahead
+of the target by the load's own cost. The position goes stale while the server
+negotiates and starts encoding, so a load aimed at where the group is *now*
+lands one load-duration behind it. That cost cannot be predicted — whether the
+server transcodes is settled by the negotiation inside the load — so measure
+it. The previous load's duration is a good enough stand-in for the next one's
+and converges after a single item: smooth it **50/50**, ignore it below
+**250ms**, discard it above **15s** (that is a dialog or a stall, not a load),
+and use zero while the group is paused, where there is no moving target to aim
+at. Err high: a member that loads early is held by the ready flow until the
+group's `Unpause`, while one that loads late is the failure being avoided.
+
 ## 11. Position beacons (v2)
 
 While a group is `Playing`, the server broadcasts a `PositionBeacon` to v2
@@ -396,12 +474,15 @@ never change play state.
 | Hot-join private start lead | max(2 × member ping, 500ms) | server |
 | Buffering grace period | 2s | server |
 | Group-wait deadline | 10s | server |
+| Correction progress threshold (§7.2) | 250ms | server |
+| Corrections before rendezvous (§7.2) | 3 | server |
 | Disconnect grace window | 90s | server |
 | Position beacon interval | 5s | server |
 | Sweep resolution | 1s | server |
 | Time sync window / cadence | best-of-8, 60s (greedy 1s ×3 on join) | client |
 | Correction dead zone / rate cap / seek threshold | 60ms / ±5% / 1500ms | client |
 | Scheduled-start arm-time alignment band (§7.1) | 100ms | client |
+| Load-ahead allowance (§10) | previous load, smoothed 50/50, 250ms floor, 15s ceiling | client |
 | Auto-rejoin rate limit | 30s | client |
 | Snapshot request rate limit | 5s | client |
 
@@ -417,7 +498,14 @@ Known conforming implementations:
 
 | Implementation | Role | Protocol |
 |---|---|---|
-| `kontell/jellyfin-plugin-syncplayv2` on stock Jellyfin 10.11 | server | v1 + v2; `Hello`/dedicated socket; hot join from 10.11.0.2 |
-| `kontell/jellyfin` `integration/syncplay-phase1` | server | v1 + v2; main-socket bindings only (no `Hello`, no hot join) |
-| `kontell/plugin.video.kofin` ≥ 0.16.0 | client | v2 |
+| `kontell/jellyfin-plugin-syncplayv2` on stock Jellyfin 10.11 / 12 | server | v1 + v2; `Hello`/dedicated socket; hot join from 10.11.0.2; rendezvous from 10.11.0.4 |
+| `kontell/jellyfin` `integration/syncplay-phase1` | server | v1 + v2; main-socket bindings only (no `Hello`, no hot join, no rendezvous) |
+| `kontell/plugin.video.kofin` ≥ 0.16.0 | client | v2; §10 load-ahead allowance from 0.19.0 |
 | jellyfin-web (stock) | client | v1 |
+
+Plugin versions above name the Jellyfin 10.11 build; the same code ships as
+`12.0.0.N` for Jellyfin 12, since only the build component distinguishes
+releases (§2.1).
+
+Rendezvous (§7.2) has no scenario yet: the suite covers the deadline it fires
+at, but only the v1 outcome of it.
