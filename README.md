@@ -66,10 +66,20 @@ python -m syncplay_kit bootstrap --base http://127.0.0.1:8097 \
 | `hot_join` | fast | v2 joiner never pauses a Playing group (§7.1) |
 | `reconnect_grace` | slow | disconnect ≠ kick; snapshot on reconnect (§9) |
 | `grace_expiry` | slow | removal after the 90s window (§9) |
+| `descriptor_queue_basic` | fast | external entries negotiated, delivered with `Content`, played (§14.1-3) |
+| `descriptor_member_veto` | fast | a member without the capability vetoes a descriptor queue (§14.4) |
+| `descriptor_visibility` | fast | descriptor groups invisible and unjoinable without the capability (§14.4) |
+| `descriptor_no_clamp` | fast | runtime-0 entries seek and report unclamped (§14.2) |
+| `descriptor_mixed_queue` | fast | library + descriptor entries advance as one queue (§14.2-3) |
 
 Scenarios are fully isolated: each uses fresh device ids (fresh server
 sessions) and its own group, so leftover state from aborted runs cannot bleed
 in.
+
+External content (§14) is covered by the `descriptor_*` family below; those
+scenarios need a server with the capability (plugin ≥ x.y.0.8) and **no real
+media anywhere** — the point of the family is that the queue entry is not a
+library item.
 
 Not yet covered: **rendezvous** (§7.2), where a v2 member the group has given
 up waiting for is pushed a snapshot and given a private scheduled start.
