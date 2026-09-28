@@ -39,6 +39,10 @@ python -m syncplay_kit run \
 - `--suite fast` (~2-3 min) covers everything except the disconnect-lifecycle
   scenarios; `--suite slow` (~5 min) runs just those; `--suite all` runs both.
 - `--scenario <name>` runs one scenario; `python -m syncplay_kit list` shows all.
+- The plugin defaults to a 30s new-item load deadline and a 10s playback stall
+  deadline. If the server uses custom values, pass `--load-timeout SECONDS` and
+  `--stall-timeout SECONDS` (use the effective values shown in its V2 Status
+  report). Other scenarios currently expect the default timing settings.
 
 Setting up a **fresh throwaway server** (completes the startup wizard, creates
 a movie library and bot users):
@@ -55,7 +59,8 @@ python -m syncplay_kit bootstrap --base http://127.0.0.1:8097 \
 | `group_info_members` | fast | Members[] status list (§5.2) |
 | `v2_negotiation` | fast | version negotiation (§2) |
 | `ws_timesync` | fast | TimeSync exchange (§3) |
-| `group_wait_deadline` | fast | 10s group-wait bound (§7) |
+| `group_wait_deadline` | fast | new-item load deadline and v2 rendezvous (§7, §7.2) |
+| `stall_wait_deadline` | fast | shorter playback stall deadline and v2 rendezvous (§7, §7.2) |
 | `buffering_grace_absorb` | fast | 2s grace hides short rebuffers (§7) |
 | `buffering_grace_expiry` | fast | sustained buffering pauses group (§7) |
 | `state_version` | fast | per-group monotonic versions (§6) |
@@ -81,11 +86,10 @@ scenarios need a server with the capability (plugin ≥ x.y.0.8) and **no real
 media anywhere** — the point of the family is that the queue entry is not a
 library item.
 
-Not yet covered: **rendezvous** (§7.2), where a v2 member the group has given
-up waiting for is pushed a snapshot and given a private scheduled start.
-`group_wait_deadline` fires the deadline it hangs off and still passes — the
-group proceeds and the member is flagged either way — but asserts only the v1
-outcome of it.
+The deadline scenarios cover timeout-triggered **rendezvous** (§7.2): a v2
+member receives a snapshot at the deadline, and a subsequent `Ready`
+receives a private scheduled start. Correction-triggered rendezvous is not yet
+covered.
 
 ## Operator self-test
 
@@ -126,12 +130,15 @@ Scenarios marked v2 in the table require a server implementing SyncPlay
 protocol v2 — the specification lives in this repository at
 `docs/SYNCPLAY.md`. `hot_join` additionally requires a server implementing
 §7.1 (the SyncPlay v2 plugin ≥ 10.11.0.2; the integrated fork barriers every
-joiner and fails it by design). Against a v1-only server, run the phase-0
-subset: `group_wait_deadline`, `buffering_grace_*` require the robustness
-patches; stock 10.x servers fail them by design (that is the point).
+joiner and fails it by design). The deadline scenarios require the plugin's
+10.11.0.8 / 12.0.0.8 timing split and v2 rendezvous. On older servers,
+`buffering_grace_*` require the robustness patches; stock 10.x servers fail
+them by design.
 
 Plugin version floors name the Jellyfin 10.11 build. One source tree ships
 against several server ABIs and only the fourth component distinguishes
 releases, so `12.0.0.4` (Jellyfin 12) is the same code as `10.11.0.4` — see
 §2.1 before comparing the string. Rendezvous (§7.2) lands in 10.11.0.4;
 10.11.0.3 shipped it on a branch that measurement showed is never reached.
+The separate load/stall deadlines and configurable timings are available in
+10.11.0.8 / 12.0.0.8.
