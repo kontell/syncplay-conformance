@@ -298,18 +298,18 @@ still expected (`IsBuffering && !IgnoreGroupWait`).
   `When = now + max(2 × highestPing, 500ms)` so all members start
   simultaneously despite differing latency.
 - **Buffering.** A `Buffering` report while the group is `Playing` is held for
-  a **2s grace period**; if the member's `Ready` arrives within it, nobody
-  else is interrupted. Otherwise the group is paused (enters `Waiting`) and
-  resumes when the member recovers.
-- **Group-wait deadline.** A member that keeps the group `Waiting` for more
-  than **10s** without reporting is flagged (`IgnoreGroupWait` +
-  internal timeout mark) and the group proceeds without it. The flag clears
-  automatically the next time one of the member's reports is processed —
-  chronically slow members become spectators, but reintegrate by reporting.
-  A **v2** member is *rendezvoused* at the deadline instead (§7.2): the group
-  proceeds exactly as above, but the member is given the means to catch up
-  rather than left where it stood. v1 members are flagged and abandoned as
-  described.
+  a configurable grace period (default **2s**); if the member's `Ready` arrives
+  within it, nobody else is interrupted. Otherwise the group is paused (enters
+  `Waiting`) and resumes when the member recovers.
+- **Group-wait deadlines.** The server waits longer for a member loading a new
+  item or joining a group (default **30s**) than for one that stalls during
+  playback or seeks within the loaded item (default **10s**). A member still
+  buffering after its deadline is flagged (`IgnoreGroupWait` + internal timeout
+  mark), and the group proceeds without it. The flag clears when the member
+  reports again. A **v2** member is *rendezvoused* at the deadline instead
+  (§7.2): it receives a snapshot and can catch up privately. A v1 member is
+  flagged and left in place until it reports again. The timing settings and
+  their ranges are in §12.
 - **Spectators.** `SetIgnoreWait {IgnoreWait: true}` opts a member out of
   being waited on; it still receives all commands.
 
@@ -371,8 +371,8 @@ Two things trigger it:
 
 - **The group-wait deadline** (§7) — the trigger that fires for the member this
   exists for. A client whose reload cycle is 6-7s answers a group `Seek` with a
-  single correction, the 10s deadline arrives, and its next report lands after
-  the group has already left `Waiting`.
+  single correction, the default 10s stall deadline arrives, and its next
+  report lands after the group has already left `Waiting`.
 - **Corrections that are not converging**, while the group is still `Waiting`.
   The first correction always gets its chance: most members are simply late and
   one seek fixes them. After that the server rendezvouses when a correction
@@ -405,8 +405,9 @@ Member ≠ session transport:
 - **Explicit leave** (`POST /SyncPlay/Leave`): immediate removal, `UserLeft`
   broadcast.
 - **Session end** (socket lost, session expired): the member is marked
-  **disconnected** for a **90s grace window**. During it: the group does not
-  wait on the member, no messages are addressed to it, and other members see
+  **disconnected** for a configurable grace window (default **90s**). During it,
+  the group does not wait on the member, no messages are addressed to it, and
+  other members see
   `IsConnected: false` in `Members`. No `UserLeft` is sent.
 - **Reconnect** during the window — any of: a new WebSocket for the session, a
   playback request over REST, or an explicit re-`Join` — re-attaches the
@@ -455,7 +456,8 @@ group's `Unpause`, while one that loads late is the failure being avoided.
 ## 11. Position beacons (v2)
 
 While a group is `Playing`, the server broadcasts a `PositionBeacon` to v2
-members every **5s** (and immediately after entering `Playing`):
+members at a configurable interval (default **5s**, and immediately after
+entering `Playing`):
 `{PlaylistItemId, PositionTicks, When}` with the envelope `StateVersion`.
 
 **Client requirement (v2):** if the beacon's `PlaylistItemId` matches the
@@ -472,12 +474,13 @@ never change play state.
 | Position tolerance | clamp(2×ping, 500ms, 2000ms) | server |
 | Unpause scheduling delay | max(2 × highest ping, 500ms) | server |
 | Hot-join private start lead | max(2 × member ping, 500ms) | server |
-| Buffering grace period | 2s | server |
-| Group-wait deadline | 10s | server |
+| Buffering grace period | 2s (0–10s) | server |
+| Stall deadline | 10s (3–120s) | server |
+| New-item load deadline | 30s (3–300s) | server |
 | Correction progress threshold (§7.2) | 250ms | server |
 | Corrections before rendezvous (§7.2) | 3 | server |
-| Disconnect grace window | 90s | server |
-| Position beacon interval | 5s | server |
+| Disconnect grace window | 90s (10–600s) | server |
+| Position beacon interval | 5s (1–60s) | server |
 | Sweep resolution | 1s | server |
 | Time sync window / cadence | best-of-8, 60s (greedy 1s ×3 on join) | client |
 | Correction dead zone / rate cap / seek threshold | 60ms / ±5% / 1500ms | client |
@@ -486,6 +489,12 @@ never change play state.
 | Auto-rejoin rate limit | 30s | client |
 | Snapshot request rate limit | 5s | client |
 | External-content entry caps (§14) | provider `[a-z0-9][a-z0-9._-]{1,39}`, key ≤512, name ≤256, image URL ≤1024, runtime ≥0, ≤200 entries/request | server |
+
+The timing ranges and defaults above describe SyncPlay v2 plugin
+10.11.0.8 / 12.0.0.8. Out-of-range settings are clamped; the effective load
+deadline is never shorter than the stall deadline. Saved timing changes take
+effect on the next use without a restart. Other server builds may use different
+timings.
 
 ## 13. Conformance
 
@@ -592,6 +601,7 @@ expect a runtime-0 item to accept seeks and reports at any position.
 | Rendezvous (§7.2) | 10.11.0.4 |
 | Null-guarded queue lookups, runtime-0 unbounded (§14.2 semantics) | 10.11.0.7 |
 | External content (§14) | 10.11.0.8 |
+| Configurable load/stall deadlines and timing ranges (§7, §12) | 10.11.0.8 |
 
 Builds are named here by the Jellyfin 10.11 line; §2.1's ordering rule maps
 them to the 12.x line (`12.0.0.N` is the same code as `10.11.0.N`).

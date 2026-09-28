@@ -14,11 +14,13 @@ from .scenarios import SCENARIOS
 class Ctx:
     """Per-run context handed to scenarios."""
 
-    def __init__(self, base, users, movie_id, verbose):
+    def __init__(self, base, users, movie_id, verbose, load_timeout=30, stall_timeout=10):
         self.base = base
         self.users = users            # [(user, password), ...]
         self.movie_id = movie_id
         self.verbose = verbose
+        self.load_timeout = load_timeout
+        self.stall_timeout = stall_timeout
         self.run_nonce = secrets.token_hex(3)
         self.scenario_index = 0
         self.scenario_name = ""
@@ -93,7 +95,12 @@ async def run(args):
         print(f"no scenario matched (scenario={args.scenario!r}, suite={args.suite!r})", file=sys.stderr)
         return 2
 
-    ctx = Ctx(args.base, users, movie_id, args.verbose)
+    if not 3 <= args.stall_timeout <= 120 or not args.stall_timeout <= args.load_timeout <= 300:
+        print("timeouts must satisfy 3 <= stall <= 120 and stall <= load <= 300", file=sys.stderr)
+        return 2
+
+    ctx = Ctx(args.base, users, movie_id, args.verbose,
+              args.load_timeout, args.stall_timeout)
     print(f"target={args.base} movie={movie_id} users={[u for u, _ in users]} "
           f"scenarios={[s.name for s in selected]}\n")
 
@@ -139,6 +146,10 @@ def build_parser():
     r.add_argument("--suite", choices=["fast", "slow", "all"], default="fast",
                    help="fast ~2-3min; slow adds the disconnect-lifecycle scenarios (~5min)")
     r.add_argument("--scenario", help="run a single scenario by name")
+    r.add_argument("--load-timeout", type=int, default=30, metavar="SECONDS",
+                   help="configured load timeout (default: 30)")
+    r.add_argument("--stall-timeout", type=int, default=10, metavar="SECONDS",
+                   help="configured stall timeout (default: 10)")
     r.add_argument("-v", "--verbose", action="store_true", help="log every message")
 
     ls = sub.add_parser("list", help="list scenarios")
